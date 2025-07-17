@@ -1,0 +1,26 @@
+services:
+
+  issuer:
+    build: ./issuer
+    ports:
+      - "8001:8000"        # host:container
+    volumes:
+      - ./issuer/data:/app/data
+
+  verifier:
+    build: ./verifier
+    ports:
+      - "8002:8000"
+    depends_on:
+      - issuer
+    volumes:
+      - ./verifier/data:/app/data
+
+  wallet:
+    build: ./wallet
+    depends_on:
+      - issuer
+    # ti fa comodo lanciare il wallet in interactive mode:
+    tty: true
+    stdin_open: true
+    command: ["python", "main.py", "serve"]
