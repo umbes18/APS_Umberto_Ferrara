@@ -14,3 +14,5 @@ cd APS_Umberto_Ferrara
 
 # 2. Avvia via Docker Compose
 docker-compose up --build
+docker-compose down
+
