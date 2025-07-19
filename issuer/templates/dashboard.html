@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <title>Issuer Dashboard</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 8px;
+      vertical-align: top;
+    }
+    th {
+      background: #eee;
+      text-align: left;
+    }
+    /* Imposta larghezze fisse per ciascuna colonna */
+    th:nth-child(1), td:nth-child(1) { width: 5%; }
+    th:nth-child(2), td:nth-child(2) { width: 10%; }  /* From */
+    th:nth-child(3), td:nth-child(3) { width: 10%; }  /* To */
+    th:nth-child(4), td:nth-child(4) { width: 15%; }  /* At */
+    th:nth-child(5), td:nth-child(5) { width: 30%; }  /* Request */
+    th:nth-child(6), td:nth-child(6) { width: 30%; }  /* Response */
+    /* Forza il wrapping dei testi lunghi */
+    td { overflow-wrap: anywhere; }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <h1>Issuer Dashboard</h1>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>From</th>
+        <th>To</th>
+        <th>At</th>
+        <th>Request</th>
+        <th>Response</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for log in logs %}
+      <tr>
+        <td>{{ log['id'] }}</td>
+        <td>{{ log['actor_from'] }}</td>
+        <td>{{ log['actor_to'] }}</td>
+        <td>{{ log['created_at'] }}</td>
+        <td><pre>{{ log['request'] }}</pre></td>
+        <td><pre>{{ log['response'] }}</pre></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>

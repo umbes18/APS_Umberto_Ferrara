@@ -1,0 +1,10 @@
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud001','9ba7ef309d64ae80e3d8417cfcec776c358bfbb3795e4a389ce5b447357d03ba');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud002','9f11d95b61e0724a80236c8242f4c6a376f65ec93bd1b9b28fe8a2816192ef9a');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud003','de854721a350d8067e4970ed2135f0aabba4a948abf9f08d3c13f81b5f7b7376');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud004','40869fbc7382618bae49cc45407638029036dc0eeeaa45d853dc6d339e10444d');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud005','bdbc71877397b4fe6779769c06a806a8cea6a66d9e92cfaa5104e9fa3a38bac7');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud006','afa59367ed30ecd7ac179d9c6bfc65e1e1327e2462800d7605b67ed116272a62');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud007','b2a1838bc6647098697044cd130e60336fcb9c4881b564d9255c1e523a3e00cb');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud008','85f6376c6bfa6413238088105d07a0b497963ca699b7c7e6282f6295efc976be');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud009','e71154bf6d062226a0c4af5c759cbafd9e5a35e5f03594c0b6e3410c10cf1100');
+INSERT INTO students(student_id, pubkey_hex) VALUES('stud010','930f92427ae7da7b44109a81616112e4bfc1b28fa659d9e7467e47fe94955f2c');
