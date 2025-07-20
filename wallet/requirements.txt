@@ -1,4 +1,6 @@
-click
-cryptography
+flask
+gunicorn
+requests
 ecdsa
+cryptography
 pycryptodome

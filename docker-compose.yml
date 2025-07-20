@@ -1,26 +1,66 @@
 services:
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "8005:8000"      # host:container
+    depends_on:
+      - issuer
+      - wallet
+    volumes:
+      # montiamo i db dei log in sola-lettura
+      - ./issuer/data:/issuer_data:ro
+      - ./wallet/data:/wallet_data:ro
+    restart: unless-stopped
 
   issuer:
     build: ./issuer
+    container_name: issuer
     ports:
-      - "8001:8000"        # host:container
+      - "8001:8000"        # HTTPS
     volumes:
       - ./issuer/data:/app/data
-
-  verifier:
-    build: ./verifier
-    ports:
-      - "8002:8000"
-    depends_on:
-      - issuer
-    volumes:
-      - ./verifier/data:/app/data
+      - ./wallet_keys:/app/wallet_keys
+      - ./templates:/app/templates:ro
+      - ./issuer_certs/issuer.crt:/etc/ssl/certs/issuer.crt:ro
+      - ./issuer_certs/issuer.key:/etc/ssl/private/issuer.key:ro
+      - ./issuer_certs/ca.crt:/etc/ssl/certs/ca.crt:ro
+    restart: unless-stopped
+    command:
+      - gunicorn
+      - main:app
+      - -b
+      - "0.0.0.0:8000"
+      - --workers
+      - "4"
+      - --certfile=/etc/ssl/certs/issuer.crt
+      - --keyfile=/etc/ssl/private/issuer.key
 
   wallet:
     build: ./wallet
+    container_name: wallet
+    ports:
+      - "8003:8000"     # host:container (HTTPS/mTLS)
     depends_on:
       - issuer
-    # ti fa comodo lanciare il wallet in interactive mode:
-    tty: true
-    stdin_open: true
-    command: ["python", "main.py", "serve"]
+    volumes:
+      # templates condivisi
+      - ./templates:/app/templates:ro
+
+      # dati (credenziali e log)
+      - ./wallet/data:/app/data
+      - ./wallet_keys:/app/wallet_keys
+      # certificati TLS
+      - ./wallet_certs/wallet.crt:/etc/ssl/certs/wallet.crt:ro
+      - ./wallet_certs/wallet.key:/etc/ssl/private/wallet.key:ro
+      - ./issuer_certs/ca.crt:/etc/ssl/certs/ca.crt:ro
+
+    environment:
+      - ISSUER_URL=https://issuer:8000
+      - ISSUER_PK_HEX=fc8c66702134323aabe913b853551230e79585d3bb829887810338b61759a8ae
+      - WALLET_KEYS_DIR=/app/wallet_keys
+
+    restart: unless-stopped
+
+
+

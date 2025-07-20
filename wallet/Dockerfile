@@ -1,8 +1,20 @@
+# wallet/Dockerfile
 FROM python:3.12-slim
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install merkletools --no-deps
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
-# il wallet è un CLI, non serve exporre porte
-CMD ["python", "main.py", "serve"]
+
+EXPOSE 8000
+
+CMD ["gunicorn", "main:app", "-b", "0.0.0.0:8000", "--workers", "3", \
+     "--certfile", "/etc/ssl/certs/wallet.crt", \
+     "--keyfile",  "/etc/ssl/private/wallet.key", \
+     "--ca-certs", "/etc/ssl/certs/ca.crt", \
+     "--cert-reqs", "2"]
