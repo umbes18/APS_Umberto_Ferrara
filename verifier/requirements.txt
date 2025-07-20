@@ -1,7 +1,5 @@
-fastapi
+flask
 gunicorn
-uvicorn[standard]
 cryptography
-ecdsa
-click
-pycryptodome
+requests
+

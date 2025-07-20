@@ -23,7 +23,7 @@
 
 <div class="container-lg">
 
-  <h2 class="mb-3">Unified Credential Flow <small class="text-muted fs-6">Issuer &middot; Wallet</small></h2>
+  <h2 class="mb-3">Credential Flow <small class="text-muted fs-6">Issuer &middot; Wallet</small></h2>
 
   <div class="table-responsive">
     <table class="table table-hover align-middle">
@@ -64,13 +64,13 @@
                       <div class="col-12 col-lg-6">
                         <strong>Request</strong>
                         <pre class="json-box"><code class="language-json">
-{{ log.request | tojson(indent=2) }}
+{{ log.request | default('{}') | tojson(indent=2) }}
                         </code></pre>
                       </div>
                       <div class="col-12 col-lg-6">
                         <strong>Response</strong>
                         <pre class="json-box"><code class="language-json">
-{{ log.response | tojson(indent=2) }}
+{{ log.response | default('{}') | tojson(indent=2) }}
                         </code></pre>
                       </div>
                     </div>
@@ -82,11 +82,13 @@
 
           </td>
           <td>
-            {% if log.source == 'issuer' %}
-               <span class="badge bg-primary">issuer</span>
-            {% else %}
-               <span class="badge bg-warning text-dark">wallet</span>
-            {% endif %}
+              {% if log.source == 'issuer' %}
+                <span class="badge bg-primary">issuer</span>
+              {% elif log.source == 'wallet' %}
+                <span class="badge bg-warning text-dark">wallet</span>
+              {% elif log.source == 'verifier' %}
+                <span class="badge bg-success">verifier</span>
+              {% endif %}
           </td>
         </tr>
       {% endfor %}

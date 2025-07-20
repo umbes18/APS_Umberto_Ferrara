@@ -1,19 +1,20 @@
-# usa immagine Python multi-arch (supporta arm64 su M1)
+# verifier/Dockerfile
 FROM python:3.12-slim
-
-# imposta la working dir
 WORKDIR /app
 
-# copia e installa dipendenze
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install merkletools --no-deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
 
-# copia il codice dentro il container
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
 
-# esponi la porta FastAPI interna
 EXPOSE 8000
 
-# comando di default
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["gunicorn", "main:app", "-b", "0.0.0.0:8000", "--workers", "3", \
+     "--certfile", "/etc/ssl/certs/verifier.crt", \
+     "--keyfile",  "/etc/ssl/private/verifier.key", \
+     "--ca-certs", "/etc/ssl/certs/ca.crt", \
+     "--cert-reqs", "2"]

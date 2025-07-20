@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file, render_template, abort
 import sqlite3, uuid, datetime, os, json, hashlib, logging, time
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -19,7 +19,7 @@ ISSUER_SK = ed25519.Ed25519PrivateKey.from_private_bytes(
 )
 ISSUER_PK_HEX = ISSUER_SK.public_key().public_bytes_raw().hex()
 
-crl_updater = CRLUpdater()   # inizializza gestore CRL
+crl_updater = CRLUpdater(ISSUER_SK)
 TEMPLATE_DASH = "dashboard.html"  # html unico riutilizzato da tutti i container
 
 # ---------- funzioni utilità DB & logging ----------
@@ -37,21 +37,79 @@ def load_student_pubkey(student_id: str) -> bytes | None:
     row = cur.fetchone(); conn.close()
     return bytes.fromhex(row["pubkey_hex"]) if row else None
 
+def ensure_issued_creds_schema():
+    """Crea la tabella issued_creds se non esiste."""
+    con = get_db_connection(); cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS issued_creds(
+            credential_id TEXT PRIMARY KEY,
+            student_id    TEXT,
+            exam_name     TEXT,
+            exam_date     TEXT,
+            grade         TEXT
+        )
+    """)
+    con.commit(); con.close()
+
+def backfill_issued_creds_from_logs():
+    """
+    Popola issued_creds leggendo i log di /issue nel DB.
+    Deve essere chiamata una sola volta all’avvio, dopo ensure_issued_creds_schema().
+    """
+    con = get_db_connection()
+    cur = con.cursor()
+
+    # prendi tutte le risposte di issue dal log (actor_from="wallet", actor_to="issuer")
+    cur.execute("""
+        SELECT response
+          FROM logs
+         WHERE actor_to = 'issuer'
+           AND response LIKE '%credential_id%'
+    """)
+    rows = cur.fetchall()
+    inserted = 0
+
+    for row in rows:
+        try:
+            resp = json.loads(row["response"])
+            cid   = resp["credential_id"]
+            stud  = resp["subject"]
+            # se nei log hai salvato exam_name e exam_date oppure grade dentro il log originale:
+            # altrimenti riprendi da resp cifrato / decifrato (ma qui ipotizziamo siano nel resp plain)
+            exam  = resp.get("exam_name")
+            date  = resp.get("exam_date")
+            grade = resp.get("grade")
+            if cid and stud:
+                cur.execute("""
+                    INSERT OR IGNORE INTO issued_creds
+                        (credential_id, student_id, exam_name, exam_date, grade)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (cid, stud, exam, date, grade))
+                inserted += cur.rowcount
+        except Exception:
+            # salta righe non-JSON o log difettosi
+            continue
+
+    con.commit()
+    con.close()
+    app.logger.info("Backfilled %d entries into issued_creds", inserted)
+
+# chiamala subito dopo ensure_issued_creds_schema()
+ensure_issued_creds_schema()
+backfill_issued_creds_from_logs()
 
 def log_interaction(frm: str, to: str, req_obj: dict, resp_obj: dict):
-    """Persistente ogni request/response nel DB (per dashboard)."""
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute(
-        """INSERT INTO logs(actor_from, actor_to, request, response, created_at)
-           VALUES(?,?,?,?,?)""",
-        (
-            frm,
-            to,
-            json.dumps(req_obj, sort_keys=True),
-            json.dumps(resp_obj, sort_keys=True),
-            datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
-    )
+    cur.execute("""
+        INSERT INTO logs(actor_from, actor_to, request, response, created_at)
+        VALUES(?,?,?,?,?)
+    """, (
+        frm,
+        to,
+        json.dumps(req_obj, sort_keys=True),
+        json.dumps(resp_obj, sort_keys=True),
+        datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ))
     conn.commit(); conn.close()
 
 # ------------------------------------------------------------------
@@ -130,6 +188,23 @@ def issue_credential():
 
     # log & risposta
     log_interaction("wallet", "issuer", data, cred)
+
+    # **Nuovo: salva mapping in issued_creds**
+    conn = get_db_connection();
+    cur = conn.cursor()
+    cur.execute("""
+                INSERT INTO issued_creds(credential_id, student_id, exam_name, exam_date, grade)
+                VALUES (?, ?, ?, ?, ?)
+                """, (
+                    cred["credential_id"],
+                    data["student_id"],
+                    data["exam_name"],
+                    exam_date,  # da rec["exam_date"]
+                    grade  # da rec["grade"]
+                ))
+    conn.commit();
+    conn.close()
+
     return jsonify(cred), 201
 
 # ------------------------------------------------------------------
@@ -141,22 +216,49 @@ def revoke():
     if not cid:
         return {"error": "credential_id required"}, 400
 
+    # --- lookup in issued_creds per student/exam/grade --------------
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""
+        SELECT student_id, exam_name, grade
+          FROM issued_creds
+         WHERE credential_id = ?
+    """, (cid,))
+    info = cur.fetchone()
+    conn.close()
+
+    # --- revoca sulla CRL (la tua logica esistente) ------------------
     updated = crl_updater.revoke(cid)
     resp = {
         "status":    "ok" if updated else "already_revoked",
-        "root":      crl_updater.crl["merkle_root"],
         "version":   crl_updater.crl["version"],
+        "root":      crl_updater.crl["merkle_root"],
         "signature": crl_updater.crl["signature"]
     }
-    log_interaction("admin", "issuer", {"revoke": cid}, resp)
-    return jsonify(resp)
+
+    # --- arricchisci JSON di request per il log ---------------------
+    req_obj = {"revoke": cid}
+    if info:
+        req_obj.update({
+            "student_id": info["student_id"],
+            "exam_name":  info["exam_name"],
+            "grade":      info["grade"]
+        })
+
+    log_interaction("admin", "issuer", req_obj, resp)
+    return jsonify(resp), 200
 
 # ------------------------------------------------------------------
 # Endpoint /crl  🌍 – distribuisce crl.json firmato
 # ------------------------------------------------------------------
 @app.route("/crl", methods=["GET"])
 def crl():
-    return send_file(CRL_PATH, mimetype="application/json")
+    # se per qualche motivo crl.json manca, rigenera sul posto
+    if not os.path.exists(CRL_PATH):
+        crl_updater._flush()
+    try:
+        return send_file(CRL_PATH, mimetype="application/json")
+    except FileNotFoundError:
+        abort(404, description="CRL not found")
 
 # ------------------------------------------------------------------
 # Endpoint /dashboard  📊 – mostra log Issuer
