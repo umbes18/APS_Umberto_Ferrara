@@ -13,6 +13,7 @@ git clone https://github.com/umbes18/APS_Umberto_Ferrara.git
 cd APS_Umberto_Ferrara
 
 # 2. Avvia via Docker Compose
-docker-compose up --build -d
 docker-compose down
+docker-compose up --build -d
+
 
