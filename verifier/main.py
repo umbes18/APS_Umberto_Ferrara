@@ -1,7 +1,15 @@
+# verifier/main.py
+
 from flask import Flask, request, jsonify
-import sqlite3, json, os, requests, datetime, hashlib, logging
+import sqlite3, json, os, requests, datetime, logging
 from datetime import timezone
-from crypto_utils import sha256, load_pubkey_hex, verify_sig
+from crypto_utils import (
+    sha256,
+    load_pubkey_hex,
+    verify_sig,
+    calc_merkle_root,
+    verify_merkle_proof
+)
 
 app = Flask(__name__, template_folder="templates")
 app.logger.setLevel(logging.DEBUG)
@@ -33,8 +41,7 @@ def ensure_logs_schema():
             created_at    TEXT
         )
     """)
-    cur.execute("PRAGMA table_info(logs)")
-    existing = {r[1] for r in cur.fetchall()}
+    existing = {r[1] for r in cur.execute("PRAGMA table_info(logs)").fetchall()}
     for col in ("credential_id","student_id","actor_from","actor_to",
                 "request","response","verdict","reason","created_at"):
         if col not in existing:
@@ -71,41 +78,71 @@ def log_interaction(frm, to, req_obj, resp_obj, verdict=None, reason=None):
 ensure_logs_schema()
 
 
-# --- Fetch & cache CRL ----------------------------------------------------
+# --- Fetch & cache CRL con firma obbligatoria e Merkle‐root soft -------------
 def fetch_crl():
+    crl = None
+    # 1) Provo a scaricare fresh
     try:
         r = requests.get(ISSUER_CRL_URL, timeout=3, verify=False)
         r.raise_for_status()
         crl = r.json()
-        # Verifica signature (logga ma non blocca)
-        payload = f"{crl['merkle_root']}|{crl['version']}|{crl['timestamp']}".encode()
-        try:
-            valid = verify_sig(ISSUER_PK, payload, crl.get("signature",""))
-            app.logger.debug("CRL sig valid: %s", valid)
-        except Exception as e:
-            app.logger.warning("CRL sig check error: %s", e)
-        # Salva in cache
-        with open(CRL_CACHE_PATH, "w") as f:
-            json.dump(crl, f, separators=(",",":"))
-        return crl
     except Exception as e:
-        app.logger.warning("CRL fetch failed (%s), using cache", e)
+        app.logger.warning("CRL fetch failed (%s), uso cache se disponibile", e)
         if os.path.exists(CRL_CACHE_PATH):
             try:
-                cached = json.load(open(CRL_CACHE_PATH))
-                app.logger.debug("Using CRL cache ts %s", cached.get("timestamp"))
-                return cached
+                crl = json.load(open(CRL_CACHE_PATH))
+                app.logger.debug("Uso CRL cache ts %s", crl.get("timestamp"))
             except Exception as e2:
-                app.logger.error("Invalid CRL cache: %s", e2)
-        return None
+                app.logger.error("Cache CRL invalida: %s", e2)
+        if crl is None:
+            return None
+
+    # 2) Verifica obbligatoria della firma Ed25519
+    payload = json.dumps(
+        {
+            "merkle_root": crl["merkle_root"],
+            "timestamp":   crl["timestamp"],
+            "version":     crl["version"],
+        },
+        sort_keys=True
+    ).encode()
+    sig_hex = crl.get("signature", "")
+    if not verify_sig(ISSUER_PK, payload, sig_hex):
+        app.logger.error("CRL signature INVALID – rigetto")
+        raise Exception("Invalid CRL signature")
+    app.logger.debug("CRL signature valid")
+
+    # 3) Ricalcolo Merkle‐root: se mismatch, loggo ma proseguo
+    try:
+        leaves   = [sha256(cid.encode()) for cid in crl.get("revoked", [])]
+        computed = calc_merkle_root(leaves).hex()
+        if computed.lower() != crl["merkle_root"].lower():
+            app.logger.warning(
+                "CRL merkle_root mismatch: expected %s, got %s – proceeding anyway",
+                crl["merkle_root"], computed
+            )
+        else:
+            app.logger.debug("CRL merkle_root verified")
+    except Exception as e:
+        app.logger.warning("Errore ricalcolo Merkle-root: %s – proceeding anyway", e)
+
+    # 4) Cache e ritorno
+    try:
+        os.makedirs(os.path.dirname(CRL_CACHE_PATH), exist_ok=True)
+        with open(CRL_CACHE_PATH, "w") as f:
+            json.dump(crl, f, separators=(",", ":"))
+    except Exception as e:
+        app.logger.error("Impossibile scrivere cache CRL: %s", e)
+
+    return crl
 
 
-# --- Verifica completa della presentazione -------------------------------
+# --- Verifica completa della presentation -------------------------------
 def verify_presentation(pres):
     # 0) anti-replay: timestamp freshness
-    ts_str = pres.get("timestamp","")
+    ts_str = pres.get("timestamp", "")
     try:
-        ts = datetime.datetime.fromisoformat(ts_str.replace("Z","+00:00"))
+        ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except Exception:
         return False, "invalid_timestamp"
     now = datetime.datetime.now(timezone.utc)
@@ -114,26 +151,29 @@ def verify_presentation(pres):
     if abs((now - ts).total_seconds()) > PRES_FRESHNESS:
         return False, "stale_presentation"
 
-    # 1) firma Wallet
+    # 1) holder signature
     cred = pres.get("credential", {})
     holder_hex = cred.get("holder_pk")
     if not holder_hex:
         return False, "missing_holder_pk"
     holder_pk = load_pubkey_hex(holder_hex)
-    sig_w = pres.get("sig_wallet","")
-    msg_w = json.dumps({k:v for k,v in pres.items() if k!="sig_wallet"}, sort_keys=True).encode()
+    sig_w = pres.get("sig_wallet", "")
+    msg_w = json.dumps({k: v for k, v in pres.items() if k != "sig_wallet"},
+                       sort_keys=True).encode()
     if not verify_sig(holder_pk, msg_w, sig_w):
         return False, "wallet_sig_invalid"
 
-    # 2) firma Issuer
-    sig_i = cred.get("sig_issuer","")
-    signed = {k:v for k,v in cred.items() if k not in ("sig_issuer","holder_pk")}
+    # 2) issuer signature
+    sig_i = cred.get("sig_issuer", "")
+    signed = {k: v for k, v in cred.items() if k not in ("sig_issuer", "holder_pk")}
     msg_i = json.dumps(signed, sort_keys=True).encode()
     if not verify_sig(ISSUER_PK, msg_i, sig_i):
         return False, "issuer_sig_invalid"
 
-    # 3) controllo scadenza
-    exp = datetime.datetime.fromisoformat(cred.get("expiration_date","").replace("Z","+00:00"))
+    # 3) expiration
+    exp = datetime.datetime.fromisoformat(
+        cred.get("expiration_date", "").replace("Z", "+00:00")
+    )
     if now > exp:
         return False, "credential_expired"
 
@@ -142,19 +182,39 @@ def verify_presentation(pres):
     if crl is None:
         return False, "crl_unavailable"
 
-    # 5) membership revoca
+    # 5) **Membership fallback**: se la credenziale è nella lista, è revocata
     cid = cred.get("credential_id")
     if cid in crl.get("revoked", []):
         return False, "credential_revoked"
 
-    # 6) commitment check
-    for attr,bundle in pres.get("revealed", {}).items():
-        salt = bytes.fromhex(bundle.get("salt",""))
-        val  = bundle.get("value","").encode()
-        if sha256(salt + val).hex() != bundle.get("comm","").lower():
+    # 6) revoca tramite Merkle‐proof O(log n) per conferma
+    proof_url = ISSUER_CRL_URL.replace("/crl", f"/proof/{cid}")
+    try:
+        rp = requests.get(proof_url, timeout=3, verify=False)
+        rp.raise_for_status()
+        proof = rp.json()
+        proof_list = proof.get("path", [])
+        index      = proof.get("leaf_index", 0)
+        root_hex   = proof.get("root", crl["merkle_root"])
+        leaf       = sha256(cid.encode())
+        if verify_merkle_proof(leaf, proof_list, root_hex, index):
+            # se la proof dice “membership in revoked tree”
+            return False, "credential_revoked"
+    except requests.HTTPError as e:
+        app.logger.warning("Proof non disponibile per %s: %s", cid, e)
+        return False, "proof_unavailable"
+    except Exception as e:
+        app.logger.error("Errore Merkle-proof per %s: %s", cid, e)
+        return False, "revoked_or_tampered"
+
+    # 7) commitment check
+    for attr, bundle in pres.get("revealed", {}).items():
+        salt = bytes.fromhex(bundle.get("salt", ""))
+        val  = bundle.get("value", "").encode()
+        if sha256(salt + val).hex() != bundle.get("comm", "").lower():
             return False, f"commitment_mismatch:{attr}"
 
-    # 7) policy enforcement
+    # 8) policy enforcement
     for needed in pres.get("need", []):
         if needed not in pres.get("revealed", {}):
             return False, "policy_unsatisfied"
@@ -167,28 +227,33 @@ def verify_presentation(pres):
 def verify():
     try:
         pres = request.get_json(force=True)
-        # 1) controllo replay persistente
+
+        # 1) replay persistente
         cid, _ = _extract_ids(pres)
         if cid:
             con = sqlite3.connect(DB_PATH); cur = con.cursor()
             cur.execute(
-                "SELECT COUNT(1) FROM logs WHERE actor_to='verifier' AND credential_id=? AND verdict='valid'",
+                "SELECT COUNT(1) FROM logs "
+                "WHERE actor_to='verifier' AND credential_id=? AND verdict='valid'",
                 (cid,)
             )
             if cur.fetchone()[0] > 0:
-                resp = {"result":"invalid","reason":"credential_replay"}
-                log_interaction("wallet","verifier", pres, resp, "invalid", "credential_replay")
+                resp = {"result": "invalid", "reason": "credential_replay"}
+                log_interaction("wallet", "verifier", pres, resp,
+                                "invalid", "credential_replay")
                 return jsonify(resp), 400
             con.close()
 
-        # 2) normale verifica
+        # 2) verifica completa
         ok, reason = verify_presentation(pres)
         resp = {"result": "valid" if ok else "invalid", "reason": reason}
-        log_interaction("wallet","verifier", pres, resp, "valid" if ok else "invalid", reason)
+        log_interaction("wallet", "verifier", pres, resp,
+                        "valid" if ok else "invalid", reason)
         return jsonify(resp), (200 if ok else 400)
+
     except Exception as e:
         app.logger.exception("Error in /verify")
-        return jsonify({"error":"internal_error","message":str(e)}), 500
+        return jsonify({"error": "internal_error", "message": str(e)}), 500
 
 
 if __name__ == "__main__":
