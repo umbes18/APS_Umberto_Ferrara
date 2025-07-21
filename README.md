@@ -1,9 +1,6 @@
 # APS_Umberto_Ferrara — WP4
 
-**Componenti**  
-- Issuer (FastAPI) → `http://localhost:8001/docs`  
-- Verifier (FastAPI) → `http://localhost:8002/docs`  
-- Wallet (CLI) → `docker-compose run --rm wallet python main.py <comando>`
+
 
 ## Setup
 

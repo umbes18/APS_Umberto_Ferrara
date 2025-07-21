@@ -147,13 +147,26 @@ def request_credential():
     sig   = wallet_sk.sign(msg).hex()
 
     req_obj = {**data, "nonce":nonce, "timestamp":ts, "signature":sig}
-    r = requests.post(
-        f"{ISSUER_URL}/issue",
-        json=req_obj,
-        cert=(WALLET_TLS_CERT, WALLET_TLS_KEY),
-        verify=CA_CERT_PATH
-    )
-    r.raise_for_status()
+    try:
+        r = requests.post(
+            f"{ISSUER_URL}/issue",
+            json=req_obj,
+            cert=(WALLET_TLS_CERT, WALLET_TLS_KEY),
+            verify=CA_CERT_PATH
+        )
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        # cattura errori dell'Issuer e restituisci JSON ben formato
+        try:
+            error_body = r.json()
+        except Exception:
+            error_body = {"error": "richiesta credenziale errata"}
+        log_interaction("wallet", "issuer", req_obj, error_body)
+        return jsonify({
+            "error": "richiesta credenziale errata",
+            "details": error_body
+        }), r.status_code
+
     cred = r.json()
 
     # verifica firma Issuer
@@ -233,16 +246,6 @@ def present_credential():
 
     log_interaction("wallet","verifier",data,pres)
     return jsonify(pres), 200
-
-# -----------------------------------------------------------------
-# /dashboard – mostra log delle interazioni
-# -----------------------------------------------------------------
-@app.get("/dashboard")
-def dashboard():
-    con = sqlite3.connect(LOG_DB); con.row_factory = sqlite3.Row
-    rows = con.execute("SELECT * FROM logs ORDER BY id DESC").fetchall()
-    con.close()
-    return render_template("dashboard.html", logs=rows)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)

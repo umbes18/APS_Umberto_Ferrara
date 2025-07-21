@@ -82,7 +82,3 @@ services:
       - ISSUER_CRL_URL=https://issuer:8000/crl
       - ISSUER_PK_HEX=fc8c66702134323aabe913b853551230e79585d3bb829887810338b61759a8ae
     restart: unless-stopped
-
-
-
-

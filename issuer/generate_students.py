@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-"""
+""""
 Popola `data/academic_records.db` con 10 studenti (stud001-stud010)
 e genera le rispettive chiavi Ed25519:
 
-    - chiave privata  → wallet_keys/studXXX.key
+    - chiave privat → wallet_keys/studXXX.key
     - chiave pubblica → tabella students (campo pubkey_hex)
 """
 import os, pathlib, sqlite3
