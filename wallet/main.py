@@ -4,6 +4,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from crypto_utils import sha256, load_pubkey_hex, verify_sig
 
 app = Flask(__name__, template_folder="templates")
 app.logger.setLevel(logging.INFO)
@@ -25,7 +26,9 @@ ISSUER_PK_HEX   = os.getenv("ISSUER_PK_HEX", "")
 # -----------------------------------------------------------------
 SK_MAP = {}
 for key_file in KEYS_DIR.glob("stud*.key"):
-    SK_MAP[key_file.stem] = ed25519.Ed25519PrivateKey.from_private_bytes(key_file.read_bytes())
+    SK_MAP[key_file.stem] = ed25519.Ed25519PrivateKey.from_private_bytes(
+        key_file.read_bytes()
+    )
 
 # -----------------------------------------------------------------
 # Fetch MASTER_KEY from issuer
@@ -58,14 +61,12 @@ def ensure_credentials_schema():
             payload         TEXT
         )
     """)
-    # Add columns if missing (migrations)
     cur.execute("PRAGMA table_info(credentials)")
-    cols = {row[1] for row in cur.fetchall()}
+    cols = {r[1] for r in cur.fetchall()}
     for col in ("iv","cipher"):
         if col not in cols:
             cur.execute(f"ALTER TABLE credentials ADD COLUMN {col} TEXT")
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
 def ensure_logs_schema():
     con = sqlite3.connect(LOG_DB)
@@ -80,8 +81,7 @@ def ensure_logs_schema():
             created_at  TEXT
         )
     """)
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
 ensure_credentials_schema()
 ensure_logs_schema()
@@ -101,8 +101,7 @@ def log_interaction(frm, to, req_obj, resp_obj):
         json.dumps(resp_obj, sort_keys=True),
         datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     ))
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
 # -----------------------------------------------------------------
 # Store credential (with iv & cipher)
@@ -127,8 +126,7 @@ def store_credential(cred: dict, payload: dict) -> None:
             json.dumps(payload)
         )
     )
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
 # -----------------------------------------------------------------
 # /request – chiedi credenziale all’Issuer
@@ -139,8 +137,9 @@ def request_credential():
     student_id = data.get("student_id")
     wallet_sk  = SK_MAP.get(student_id)
     if wallet_sk is None:
-        return {"error":"unknown student_id"}, 400
+        return jsonify({"error":"unknown student_id"}), 400
 
+    # costruzione del messaggio firmato
     nonce = uuid.uuid4().hex
     ts    = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     msg   = f"{student_id}|{data['exam_name']}|{data['exam_date']}|{nonce}|{ts}".encode()
@@ -155,35 +154,38 @@ def request_credential():
             verify=CA_CERT_PATH
         )
         r.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        # cattura errori dell'Issuer e restituisci JSON ben formato
+    except requests.exceptions.HTTPError:
+        # uniforma l'errore
         try:
-            error_body = r.json()
+            err = r.json()
         except Exception:
-            error_body = {"error": "richiesta credenziale errata"}
-        log_interaction("wallet", "issuer", req_obj, error_body)
+            err = {"error":"richiesta credenziale errata"}
+        log_interaction("wallet","issuer",req_obj,err)
         return jsonify({
             "error": "richiesta credenziale errata",
-            "details": error_body
+            "details": err
         }), r.status_code
 
     cred = r.json()
 
-    # verifica firma Issuer
+    # verifica firma Issuer con crypto_utils
+    pub = load_pubkey_hex(ISSUER_PK_HEX)
     to_verify = {k:v for k,v in cred.items() if k!="sig_issuer"}
-    ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(ISSUER_PK_HEX)) \
-        .verify(bytes.fromhex(cred["sig_issuer"]),
-                json.dumps(to_verify, sort_keys=True).encode())
+    payload = json.dumps(to_verify, sort_keys=True).encode()
+    if not verify_sig(pub, payload, cred["sig_issuer"]):
+        return jsonify({"error":"issuer_sig_invalid"}), 400
 
     # decifra payload
     hkdf = HKDF(algorithm=hashes.SHA256(), length=32,
                 salt=cred["credential_id"].encode(), info=None)
     k_enc = hkdf.derive(MASTER_KEY)
     aes   = AESGCM(k_enc)
-    payload = json.loads(aes.decrypt(
+    plain = aes.decrypt(
         bytes.fromhex(cred["iv"]),
-        bytes.fromhex(cred["cipher"]), None
-    ))
+        bytes.fromhex(cred["cipher"]),
+        None
+    )
+    payload = json.loads(plain)
 
     store_credential(cred, payload)
     log_interaction("wallet","issuer",req_obj,cred)
@@ -198,20 +200,22 @@ def present_credential():
     cred_id = data.get("credential_id")
     need    = data.get("need", [])
 
+    # carica cred da DB
     con = sqlite3.connect(CRED_DB); con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute("SELECT * FROM credentials WHERE credential_id=?", (cred_id,))
-    row = cur.fetchone()
-    con.close()
+    row = cur.fetchone(); con.close()
     if not row:
-        return {"error":"unknown credential_id"}, 404
+        return jsonify({"error":"unknown credential_id"}), 404
 
     payload   = json.loads(row["payload"])
-    wallet_sk = SK_MAP[row["subject"]]
+    subject   = row["subject"]
+    wallet_sk = SK_MAP[subject]
 
+    # prepara metadati della cred
     cred_meta = {
         "issuer":          row["issuer"],
-        "subject":         row["subject"],
+        "subject":         subject,
         "issue_date":      row["issue_date"],
         "expiration_date": row["expiration_date"],
         "credential_id":   cred_id,
@@ -224,11 +228,12 @@ def present_credential():
         "sig_issuer":      row["sig_issuer"]
     }
 
+    # estrai solo gli attributi richiesti
     revealed = {
         attr: {
             "value": payload[attr],
-            "salt":  payload.get(f"salt_{attr}"),
-            "comm":  payload.get(f"comm_{attr}")
+            "salt":  payload[f"salt_{attr}"],
+            "comm":  payload[f"comm_{attr}"]
         }
         for attr in need if attr in payload
     }
@@ -240,12 +245,31 @@ def present_credential():
         "nonce":      uuid.uuid4().hex,
         "timestamp":  datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     }
-    pres["sig_wallet"] = wallet_sk.sign(
-        json.dumps(pres, sort_keys=True).encode()
-    ).hex()
+    # firma Wallet sulla presentation
+    msg = json.dumps(pres, sort_keys=True).encode()
+    pres["sig_wallet"] = wallet_sk.sign(msg).hex()
 
     log_interaction("wallet","verifier",data,pres)
     return jsonify(pres), 200
+
+# -----------------------------------------------------------------
+# /presentAndVerify – one-shot: presenta e inoltra al Verifier
+# -----------------------------------------------------------------
+@app.post("/presentAndVerify")
+def present_and_verify():
+    pres = present_credential().get_json()
+    r = requests.post(
+        f"{os.getenv('VERIFIER_URL','https://verifier:8000')}/verify",
+        json=pres,
+        cert=(WALLET_TLS_CERT, WALLET_TLS_KEY),
+        verify=CA_CERT_PATH
+    )
+    # mantieni status code e body
+    try:
+        body = r.json()
+    except Exception:
+        body = {"error":"verifier_error"}
+    return jsonify(body), r.status_code
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)

@@ -1,64 +1,52 @@
-"""
-Modulo CRL con Merkle tree – Issuer side
-"""
-
 import json, os, datetime, hashlib, threading, time, tempfile
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 CRL_PATH   = "/app/data/crl.json"
-ROLL_TIME  = 60                      # flush periodico (s)
-
+ROLL_TIME  = 60  # flush periodico (s)
 
 def _sha(b: bytes) -> bytes:
     return hashlib.sha256(b).digest()
 
-
 def _merkle_root(leaves: list[str]) -> str:
     if not leaves:
-        # SHA256("") canonicalizzato per albero vuoto
-        return hashlib.sha256(b"").hexdigest()
-
-    layer = [_sha(cid.encode()) for cid in sorted(leaves)]
-    while len(layer) > 1:
-        if len(layer) % 2:                     # duplica se dispari
-            layer.append(layer[-1])
-        layer = [_sha(layer[i] + layer[i + 1]) for i in range(0, len(layer), 2)]
-    return layer[0].hex()
-
+        return _sha(b"").hex()
+    level = [ _sha(x.encode()) for x in leaves ]
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        next_level = []
+        for i in range(0, len(level), 2):
+            left, right = level[i], level[i+1]
+            next_level.append(_sha(left + right))
+        level = next_level
+    return level[0].hex()
 
 class CRLUpdater:
     """
     Gestisce in RAM e su disco la CRL firmata dall’Issuer.
     """
-
     def __init__(self, issuer_sk: ed25519.Ed25519PrivateKey):
         self._issuer_sk = issuer_sk
 
-        # carica da disco o crea struttura vuota
+        # carica da disco o struttura vuota
         if os.path.exists(CRL_PATH):
-            with open(CRL_PATH) as f:
+            with open(CRL_PATH, "r") as f:
                 self.crl = json.load(f)
         else:
             self.crl = {
-                "version": 0,
-                "timestamp": "",
-                "revoked": [],
+                "version":     0,
+                "timestamp":   "",
+                "revoked":     [],
                 "merkle_root": "",
-                "signature": "",
+                "signature":   ""
             }
 
-        os.makedirs(os.path.dirname(CRL_PATH), exist_ok=True)
-
-        # calcola radice + firma subito
-        self._recompute()
+        # Inizializza subito la CRL sul filesystem
         self._flush()
 
-        # thread di roll-over periodico
+        # avvia il flush periodico in background
         threading.Thread(target=self._auto_flush, daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # API pubblico
-    # ------------------------------------------------------------------
     def revoke(self, credential_id: str) -> bool:
         """
         Aggiunge l'ID nella lista 'revoked'.
@@ -75,34 +63,34 @@ class CRLUpdater:
     # Funzioni interne
     # ------------------------------------------------------------------
     def _recompute(self):
+        # 1) Aggiorniamo il timestamp **PRIMA** di firmare
         now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        # aggiorna meta-dati
-        self.crl["version"] += 1
         self.crl["timestamp"] = now
+
+        # 2) Incrementiamo la versione
+        self.crl["version"] += 1
+
+        # 3) Ricaviamo il nuovo Merkle root
         self.crl["merkle_root"] = _merkle_root(self.crl["revoked"])
 
-        # firma sulla tupla (root, version, timestamp) ordinata
-        sign_payload = json.dumps(
+        # 4) Firmiamo la tupla (root, version, timestamp)
+        payload = json.dumps(
             {
                 "merkle_root": self.crl["merkle_root"],
-                "version": self.crl["version"],
-                "timestamp": self.crl["timestamp"],
+                "timestamp":   self.crl["timestamp"],
+                "version":     self.crl["version"],
             },
-            sort_keys=True,
+            sort_keys=True
         ).encode()
-
-        self.crl["signature"] = self._issuer_sk.sign(sign_payload).hex()
+        self.crl["signature"] = self._issuer_sk.sign(payload).hex()
 
     def _flush(self):
-        # tmp unico e atomico nella stessa dir di crl.json
-        fd, tmp_path = tempfile.mkstemp(
-            dir=os.path.dirname(CRL_PATH), prefix="crl_", suffix=".tmp"
-        )
+        # Scrive atomicamente self.crl in CRL_PATH
+        dirn = os.path.dirname(CRL_PATH)
+        os.makedirs(dirn, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=dirn)
         with os.fdopen(fd, "w") as f:
             json.dump(self.crl, f, separators=(",", ":"))
-
-        # tenta la sostituzione; se un altro worker ha già finito,
-        # il nostro tmp non serve più -> lo rimuoviamo
         try:
             os.replace(tmp_path, CRL_PATH)
         except FileNotFoundError:
