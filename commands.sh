@@ -2,10 +2,10 @@ curl -k \
   --cert ./wallet_certs/wallet.crt \
   --key  ./wallet_certs/wallet.key \
   -H "Content-Type: application/json" \
-    -d '{"student_id":"stud002","exam_name":"Criptografia","exam_date":"2025-06-22"}' \
+    -d '{"student_id":"stud008","exam_name":"Programmazione Avanzata","exam_date":"2025-07-05"}' \
   https://localhost:8003/request
 
-CID=b1c8c5ef-5dc3-42da-a618-0c70297954f8
+CID=0817dc7f-7a27-4a7a-af61-94c71225c652
 curl -k --cert ./wallet_certs/wallet.crt \
      --key  ./wallet_certs/wallet.key \
      -H 'Content-Type: application/json' \
@@ -19,7 +19,7 @@ curl -k --cert ./wallet_certs/wallet.crt \
      --data-binary @pres.json \
      https://localhost:8004/verify | jq .
 
-CID=b1c8c5ef-5dc3-42da-a618-0c70297954f8
+CID=b659aff4-7309-46c4-88a2-48c0afbff0b6
 curl -k \
   --cert admin.crt \
   --key  admin.key \
