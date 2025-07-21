@@ -1,4 +1,0 @@
-git checkout main
-git merge wp4
-git tag -a v1.0-wp4 -m "Consegna WP4"
-git push origin main --tags
