@@ -1,0 +1,12 @@
+{
+  "credential_id": "6b888c30-d52d-475f-8a47-cc5615a0841d",
+  "need": [
+    "exam_name",
+    "exam_date",
+    "grade"
+  ],
+  "challenge": "24afee5bcef60a66e655754d817bbb7a",
+  "audience": "exam-portal",
+  "request_id": "447744fd10ac7402ef701254e4c49891",
+  "expires_at": "2025-08-16T14:28:20Z"
+}

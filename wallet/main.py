@@ -10,7 +10,7 @@ app = Flask(__name__, template_folder="templates")
 app.logger.setLevel(logging.INFO)
 
 # -----------------------------------------------------------------
-# Config
+# Configurazione
 # -----------------------------------------------------------------
 CRED_DB         = "/app/data/wallet_credentials.db"
 LOG_DB          = "/app/data/wallet_logs.db"
@@ -20,9 +20,10 @@ WALLET_TLS_CERT = os.getenv("WALLET_TLS_CERT_PATH", "/etc/ssl/certs/wallet.crt")
 WALLET_TLS_KEY  = os.getenv("WALLET_TLS_KEY_PATH", "/etc/ssl/private/wallet.key")
 KEYS_DIR        = pathlib.Path(os.getenv("WALLET_KEYS_DIR", "/app/wallet_keys"))
 ISSUER_PK_HEX   = os.getenv("ISSUER_PK_HEX", "")
+VERIFIER_URL    = os.getenv("VERIFIER_URL","https://verifier:8000")  # NEW: usato in /presentAndVerify
 
 # -----------------------------------------------------------------
-# Wallet keypairs
+# Wallet keypairs (chiavi private degli studenti nel Wallet)
 # -----------------------------------------------------------------
 SK_MAP = {}
 for key_file in KEYS_DIR.glob("stud*.key"):
@@ -31,7 +32,7 @@ for key_file in KEYS_DIR.glob("stud*.key"):
     )
 
 # -----------------------------------------------------------------
-# Fetch MASTER_KEY from issuer
+# Fetch MASTER_KEY dall'Issuer (per decifrare le credenziali)
 # -----------------------------------------------------------------
 resp = requests.get(
     f"{ISSUER_URL}/provision",
@@ -42,7 +43,7 @@ resp.raise_for_status()
 MASTER_KEY = bytes.fromhex(resp.json()["master_key"])
 
 # -----------------------------------------------------------------
-# Database schema helpers
+# Database schema helpers (credenziali e log locali)
 # -----------------------------------------------------------------
 def ensure_credentials_schema():
     con = sqlite3.connect(CRED_DB)
@@ -61,9 +62,10 @@ def ensure_credentials_schema():
             payload         TEXT
         )
     """)
+    # Assicura che le colonne iv/cipher esistano (aggiornamento schema se serve)
     cur.execute("PRAGMA table_info(credentials)")
     cols = {r[1] for r in cur.fetchall()}
-    for col in ("iv","cipher"):
+    for col in ("iv", "cipher"):
         if col not in cols:
             cur.execute(f"ALTER TABLE credentials ADD COLUMN {col} TEXT")
     con.commit(); con.close()
@@ -87,7 +89,7 @@ ensure_credentials_schema()
 ensure_logs_schema()
 
 # -----------------------------------------------------------------
-# Logging helper
+# Logging helper (registra su DB locale ogni interazione)
 # -----------------------------------------------------------------
 def log_interaction(frm, to, req_obj, resp_obj):
     con = sqlite3.connect(LOG_DB)
@@ -104,7 +106,7 @@ def log_interaction(frm, to, req_obj, resp_obj):
     con.commit(); con.close()
 
 # -----------------------------------------------------------------
-# Store credential (with iv & cipher)
+# Store credential (salva la credenziale nel database locale del Wallet)
 # -----------------------------------------------------------------
 def store_credential(cred: dict, payload: dict) -> None:
     con = sqlite3.connect(CRED_DB)
@@ -129,7 +131,7 @@ def store_credential(cred: dict, payload: dict) -> None:
     con.commit(); con.close()
 
 # -----------------------------------------------------------------
-# /request – chiedi credenziale all’Issuer
+# /request – il Wallet richiede le proprie credenziali all’Issuer
 # -----------------------------------------------------------------
 @app.post("/request")
 def request_credential():
@@ -137,15 +139,16 @@ def request_credential():
     student_id = data.get("student_id")
     wallet_sk  = SK_MAP.get(student_id)
     if wallet_sk is None:
-        return jsonify({"error":"unknown student_id"}), 400
+        return jsonify({"error": "unknown student_id"}), 400
 
-    # costruzione del messaggio firmato
+    # Costruisce il messaggio da firmare (student_id|nonce|timestamp) e firma con la chiave privata del Wallet
     nonce = uuid.uuid4().hex
     ts    = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    msg   = f"{student_id}|{data['exam_name']}|{data['exam_date']}|{nonce}|{ts}".encode()
+    msg   = f"{student_id}|{nonce}|{ts}".encode()
     sig   = wallet_sk.sign(msg).hex()
 
-    req_obj = {**data, "nonce":nonce, "timestamp":ts, "signature":sig}
+    # Prepara la richiesta JSON da inviare all'Issuer (autenticata con la firma)
+    req_obj = {"student_id": student_id, "nonce": nonce, "timestamp": ts, "signature": sig}
     try:
         r = requests.post(
             f"{ISSUER_URL}/issue",
@@ -155,44 +158,74 @@ def request_credential():
         )
         r.raise_for_status()
     except requests.exceptions.HTTPError:
-        # uniforma l'errore
+        # Gestione errori uniformata
         try:
             err = r.json()
         except Exception:
-            err = {"error":"richiesta credenziale errata"}
-        log_interaction("wallet","issuer",req_obj,err)
+            err = {"error": "richiesta credenziale errata"}
+        log_interaction("wallet", "issuer", req_obj, err)
         return jsonify({
             "error": "richiesta credenziale errata",
             "details": err
         }), r.status_code
 
-    cred = r.json()
+    # Elaborazione della risposta dell'Issuer
+    resp = r.json()
+    credentials = resp.get("credentials")
+    if credentials is None:
+        credentials = [resp]  # (fallback nel caso l'Issuer restituisca una singola credenziale)
 
-    # verifica firma Issuer con crypto_utils
+    # Verifica la firma dell’Issuer su ogni credenziale ricevuta
     pub = load_pubkey_hex(ISSUER_PK_HEX)
-    to_verify = {k:v for k,v in cred.items() if k!="sig_issuer"}
-    payload = json.dumps(to_verify, sort_keys=True).encode()
-    if not verify_sig(pub, payload, cred["sig_issuer"]):
-        return jsonify({"error":"issuer_sig_invalid"}), 400
+    for cred in credentials:
+        to_verify = {k: v for k, v in cred.items() if k != "sig_issuer"}
+        payload_sig = json.dumps(to_verify, sort_keys=True).encode()
+        if not verify_sig(pub, payload_sig, cred["sig_issuer"]):
+            return jsonify({"error": "issuer_sig_invalid"}), 400
 
-    # decifra payload
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32,
-                salt=cred["credential_id"].encode(), info=None)
-    k_enc = hkdf.derive(MASTER_KEY)
-    aes   = AESGCM(k_enc)
-    plain = aes.decrypt(
-        bytes.fromhex(cred["iv"]),
-        bytes.fromhex(cred["cipher"]),
-        None
-    )
-    payload = json.loads(plain)
+    # Decifra il payload di ciascuna credenziale e la memorizza localmente
+    for cred in credentials:
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=cred["credential_id"].encode(), info=None)
+        k_enc = hkdf.derive(MASTER_KEY)
+        aes   = AESGCM(k_enc)
+        # ricostruisci l’AAD dagli header della credenziale
+        aad = {
+            "issuer":          cred["issuer"],
+            "subject":         cred["subject"],
+            "issue_date":      cred["issue_date"],
+            "expiration_date": cred["expiration_date"],
+            "credential_id":   cred["credential_id"]
+        }
+        aad_bytes = json.dumps(aad, sort_keys=True, separators=(",", ":")).encode()
+        plain = aes.decrypt(bytes.fromhex(cred["iv"]),
+                            bytes.fromhex(cred["cipher"]),
+                            aad_bytes)
+        payload = json.loads(plain)
+        store_credential(cred, payload)
 
-    store_credential(cred, payload)
-    log_interaction("wallet","issuer",req_obj,cred)
-    return jsonify(cred), 200
+    # Logga l’interazione e restituisce al chiamante tutte le credenziali ricevute
+    log_interaction("wallet", "issuer", req_obj, resp)
+    return jsonify(resp), 200
 
 # -----------------------------------------------------------------
-# /present – costruisci presentation per il Verifier
+# Helper: recupera la Merkle proof dall'Issuer (NEW)
+# -----------------------------------------------------------------
+def _fetch_merkle_proof(credential_id: str) -> dict:
+    try:
+        r = requests.get(
+            f"{ISSUER_URL}/proof/{credential_id}",
+            cert=(WALLET_TLS_CERT, WALLET_TLS_KEY),
+            verify=CA_CERT_PATH,
+            timeout=4
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        app.logger.warning("Merkle proof fetch failed: %s", e)
+        return {}
+
+# -----------------------------------------------------------------
+# /present – costruisce una presentazione delle credenziali per il Verifier
 # -----------------------------------------------------------------
 @app.post("/present")
 def present_credential():
@@ -200,19 +233,25 @@ def present_credential():
     cred_id = data.get("credential_id")
     need    = data.get("need", [])
 
-    # carica cred da DB
+    # NEW: (opzionali, per il flow realistico Verifier→Wallet)
+    challenge  = data.get("challenge")     # se presente, usato come nonce
+    audience   = data.get("audience")      # opzionale
+    request_id = data.get("request_id")    # opzionale
+    expires_at = data.get("expires_at")    # opzionale (ISO8601)
+
+    # Recupera la credenziale dal DB locale
     con = sqlite3.connect(CRED_DB); con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute("SELECT * FROM credentials WHERE credential_id=?", (cred_id,))
     row = cur.fetchone(); con.close()
     if not row:
-        return jsonify({"error":"unknown credential_id"}), 404
+        return jsonify({"error": "unknown credential_id"}), 404
 
     payload   = json.loads(row["payload"])
     subject   = row["subject"]
     wallet_sk = SK_MAP[subject]
 
-    # prepara metadati della cred
+    # Prepara i metadati della credenziale da presentare
     cred_meta = {
         "issuer":          row["issuer"],
         "subject":         subject,
@@ -228,7 +267,7 @@ def present_credential():
         "sig_issuer":      row["sig_issuer"]
     }
 
-    # estrai solo gli attributi richiesti
+    # Estrae solo gli attributi richiesti dalla policy del Verifier
     revealed = {
         attr: {
             "value": payload[attr],
@@ -238,37 +277,53 @@ def present_credential():
         for attr in need if attr in payload
     }
 
+    # NEW: nonce = challenge del Verifier (se presente), altrimenti generato localmente
+    nonce = challenge if challenge else uuid.uuid4().hex
+
+    # NEW: allega la Merkle proof (se l'Issuer la fornisce)
+    merkle = _fetch_merkle_proof(cred_id)
+    merkle_proof = {"credential_id": cred_id}
+    if isinstance(merkle, dict):
+        merkle_proof.update(merkle)
+
     pres = {
         "credential": cred_meta,
         "need":       need,
         "revealed":   revealed,
-        "nonce":      uuid.uuid4().hex,
-        "timestamp":  datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        "nonce":      nonce,
+        "timestamp":  datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "merkle_proof": merkle_proof  # NEW
     }
-    # firma Wallet sulla presentation
+
+    # NEW: se il Verifier ha emesso audience/request_id/expires_at, li includiamo
+    if audience:   pres["audience"]   = audience
+    if request_id: pres["request_id"] = request_id
+    if expires_at: pres["expires_at"] = expires_at
+
+    # Firma il pacchetto di presentazione con la chiave privata del Wallet
     msg = json.dumps(pres, sort_keys=True).encode()
     pres["sig_wallet"] = wallet_sk.sign(msg).hex()
 
-    log_interaction("wallet","verifier",data,pres)
+    log_interaction("wallet", "verifier", data, pres)
     return jsonify(pres), 200
 
 # -----------------------------------------------------------------
-# /presentAndVerify – one-shot: presenta e inoltra al Verifier
+# /presentAndVerify – one-shot: presenta la credenziale e inoltra al Verifier
 # -----------------------------------------------------------------
 @app.post("/presentAndVerify")
 def present_and_verify():
     pres = present_credential().get_json()
     r = requests.post(
-        f"{os.getenv('VERIFIER_URL','https://verifier:8000')}/verify",
+        f"{VERIFIER_URL}/verify",            # NEW: usa VERIFIER_URL già previsto
         json=pres,
         cert=(WALLET_TLS_CERT, WALLET_TLS_KEY),
         verify=CA_CERT_PATH
     )
-    # mantieni status code e body
+    # Mantiene status code e body della risposta del Verifier
     try:
         body = r.json()
     except Exception:
-        body = {"error":"verifier_error"}
+        body = {"error": "verifier_error"}
     return jsonify(body), r.status_code
 
 if __name__ == "__main__":
